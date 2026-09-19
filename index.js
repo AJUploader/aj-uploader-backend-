@@ -4,6 +4,12 @@ const cors = require("cors");
 const Database = require("better-sqlite3");
 const { nanoid, customAlphabet } = require("nanoid");
 const TelegramBot = require("node-telegram-bot-api");
+const multer = require("multer");
+const ffmpegPath = require("ffmpeg-static");
+const { spawn } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
 
 // ---------- Config ----------
 const PORT = process.env.PORT || 3000;
@@ -16,14 +22,22 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-// Plan limits
+// Plan limits (upload count)
 const LIMITS = {
   normal: { max: 3, periodMs: 7 * 24 * 60 * 60 * 1000 },   // 3 / week
   vip:    { max: 10, periodMs: 24 * 60 * 60 * 1000 },      // 10 / day
 };
 
+// Plan limits (file size, in MB)
+const FILE_LIMITS = { normal: 80, vip: 95 };
+
 const AUTH_CODE_TTL_MS = 5 * 60 * 1000;     // 5 minutes to enter the code
 const SESSION_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
+const PATCH_TOKEN_TTL_MS = 10 * 60 * 1000;  // 10 minutes to actually upload the file
+const FFMPEG_TIMEOUT_MS = 8 * 60 * 1000;    // kill ffmpeg if it runs longer than this
+
+const TMP_DIR = path.join(os.tmpdir(), "aj-uploads");
+fs.mkdirSync(TMP_DIR, { recursive: true });
 
 // ---------- DB ----------
 const db = new Database("aj.db");
@@ -59,6 +73,16 @@ CREATE TABLE IF NOT EXISTS login_polls (
 CREATE TABLE IF NOT EXISTS sessions (
   token TEXT PRIMARY KEY,
   telegram_id TEXT NOT NULL,
+  created_at INTEGER,
+  expires_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS patch_tokens (
+  token TEXT PRIMARY KEY,
+  telegram_id TEXT NOT NULL,
+  mode TEXT,
+  name TEXT,
+  consumed INTEGER DEFAULT 0,
   created_at INTEGER,
   expires_at INTEGER
 );
@@ -141,14 +165,72 @@ function toProfile(user) {
 function requireBearer(req, res, next) {
   const auth = req.headers.authorization || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-  if (!token) return res.status(401).json({ valid: false, error: "missing_token" });
+  if (!token) return res.status(401).json({ valid: false, error: "not_authorized" });
   const row = db.prepare("SELECT * FROM sessions WHERE token = ?").get(token);
-  if (!row || row.expires_at < nowSec()) return res.status(401).json({ valid: false, error: "invalid_token" });
+  if (!row || row.expires_at < nowSec()) return res.status(401).json({ valid: false, error: "not_authorized" });
   const user = getUserByTelegramId(row.telegram_id);
-  if (!user) return res.status(401).json({ valid: false, error: "user_not_found" });
+  if (!user) return res.status(401).json({ valid: false, error: "not_authorized" });
   req.user = refreshUserPeriod(user);
   req.sessionToken = token;
   next();
+}
+
+// ---------- ffmpeg ----------
+// mode: "hq"  -> quality re-encode, cap 1080p60
+//       "fps" -> faster encode, force 60fps, cap 1080p
+//       "4k"  -> VIP only, upscale to 4K60
+function buildFfmpegArgs(mode, inputPath, outputPath) {
+  const common = ["-y", "-i", inputPath, "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"];
+  if (mode === "4k") {
+    return [
+      ...common.slice(0, 2), inputPath,
+      "-vf", "scale=3840:-2:flags=lanczos,fps=60",
+      "-c:v", "libx264", "-preset", "medium", "-crf", "16",
+      "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+      outputPath,
+    ];
+  }
+  if (mode === "fps") {
+    return [
+      "-y", "-i", inputPath,
+      "-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,fps=60",
+      "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+      "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+      outputPath,
+    ];
+  }
+  // default "hq"
+  return [
+    "-y", "-i", inputPath,
+    "-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,fps=60",
+    "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+    "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+    outputPath,
+  ];
+}
+
+function runFfmpeg(mode, inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    const args = buildFfmpegArgs(mode, inputPath, outputPath);
+    const proc = spawn(ffmpegPath, args);
+    let stderr = "";
+    const killTimer = setTimeout(() => {
+      proc.kill("SIGKILL");
+      reject(new Error("ffmpeg_timeout"));
+    }, FFMPEG_TIMEOUT_MS);
+
+    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.on("error", (err) => { clearTimeout(killTimer); reject(err); });
+    proc.on("close", (code) => {
+      clearTimeout(killTimer);
+      if (code === 0) resolve();
+      else reject(new Error("ffmpeg_failed: " + stderr.slice(-800)));
+    });
+  });
+}
+
+function safeUnlink(p) {
+  fs.unlink(p, () => {});
 }
 
 // ---------- Telegram bot (long polling) ----------
@@ -202,6 +284,11 @@ bot.on("message", async (msg) => {
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+const upload = multer({
+  dest: TMP_DIR,
+  limits: { fileSize: 100 * 1024 * 1024 }, // hard ceiling, per-plan check happens separately
+});
 
 const router = express.Router();
 
@@ -265,9 +352,8 @@ router.post("/auth/check", (req, res) => {
     status: "authorized",
     session: token,
     profile: toProfile(fresh),
-    // "patch" (the server-side quality-boost pipeline) is intentionally off —
-    // that feature isn't implemented on this server.
-    features: { patch: false, signature: false, fps60: false },
+    // Real HD processing is now live.
+    features: { patch: true, signature: false, fps60: true },
   });
 });
 
@@ -275,7 +361,7 @@ router.post("/session/validate", requireBearer, (req, res) => {
   res.json({
     valid: true,
     profile: toProfile(req.user),
-    features: { patch: false, signature: false, fps60: false },
+    features: { patch: true, signature: false, fps60: true },
     maintenance: { on: false, hd: false, message: "" },
   });
 });
@@ -285,9 +371,6 @@ router.post("/session/logout", requireBearer, (req, res) => {
   res.json({ ok: true });
 });
 
-// Usage endpoints (for a future in-popup "consume" action, e.g. once you wire
-// up your own quality-processing pipeline). Safe to call any time to read
-// or increment the current plan's counter.
 router.get("/usage/status", requireBearer, (req, res) => {
   res.json({ ok: true, usage: usageInfo(req.user) });
 });
@@ -300,6 +383,96 @@ router.post("/usage/consume", requireBearer, (req, res) => {
   db.prepare("UPDATE users SET usage_count = usage_count + 1 WHERE telegram_id = ?").run(req.user.telegram_id);
   const fresh = refreshUserPeriod(getUserByTelegramId(req.user.telegram_id));
   res.json({ ok: true, usage: usageInfo(fresh) });
+});
+
+// ---- Video processing ----
+
+// Step 1: the extension asks to start an HD upload. We check plan limits and
+// file-size limits, then hand back a one-time upload URL/token.
+router.post("/patch/allocate", requireBearer, (req, res) => {
+  const { size, name, mode } = req.body || {};
+  const user = req.user;
+
+  if (!size || typeof size !== "number") {
+    return res.status(400).json({ ok: false, error: "bad_request" });
+  }
+
+  const maxMb = FILE_LIMITS[user.plan] || FILE_LIMITS.normal;
+  if (size > maxMb * 1024 * 1024) {
+    return res.status(413).json({ ok: false, error: "file_too_large" });
+  }
+
+  const info = usageInfo(user);
+  if (info.remaining <= 0) {
+    return res.status(429).json({ ok: false, error: "limit_reached" });
+  }
+
+  // Only VIP users may request 4K upscaling; anything else silently falls
+  // back to the normal quality re-encode.
+  const safeMode = mode === "4k" && user.plan === "vip" ? "4k" : (mode === "fps" ? "fps" : "hq");
+
+  const token = nanoid(24);
+  const createdAt = nowSec();
+  db.prepare(
+    "INSERT INTO patch_tokens (token, telegram_id, mode, name, consumed, created_at, expires_at) VALUES (?, ?, ?, ?, 0, ?, ?)"
+  ).run(token, user.telegram_id, safeMode, String(name || "video.mp4"), createdAt, createdAt + Math.floor(PATCH_TOKEN_TTL_MS / 1000));
+
+  const host = `${req.protocol}://${req.get("host")}`;
+  res.json({
+    ok: true,
+    payload: {
+      upload_token: token,
+      upload_url: `${host}/api/ext/patch/upload/${token}`,
+    },
+  });
+});
+
+// Step 2: the extension POSTs the raw video here (multipart form: token + file)
+// and gets the re-encoded video back directly in the response body.
+router.post("/patch/upload/:token", upload.single("file"), async (req, res) => {
+  const { token } = req.params;
+  const row = db.prepare("SELECT * FROM patch_tokens WHERE token = ?").get(token);
+
+  const cleanupUpload = () => { if (req.file) safeUnlink(req.file.path); };
+
+  if (!row || row.consumed || row.expires_at < nowSec()) {
+    cleanupUpload();
+    return res.status(410).json({ ok: false, error: "allocate_failed" });
+  }
+  if (!req.file) {
+    return res.status(400).json({ ok: false, error: "bad_request" });
+  }
+
+  const inputPath = req.file.path;
+  const outputPath = path.join(TMP_DIR, `${token}-out.mp4`);
+
+  try {
+    await runFfmpeg(row.mode || "hq", inputPath, outputPath);
+
+    // Mark the token used and count this upload against the user's quota
+    // only once processing actually succeeded.
+    db.prepare("UPDATE patch_tokens SET consumed = 1 WHERE token = ?").run(token);
+    db.prepare("UPDATE users SET usage_count = usage_count + 1 WHERE telegram_id = ?").run(row.telegram_id);
+
+    const stat = fs.statSync(outputPath);
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Content-Length", stat.size);
+    const stream = fs.createReadStream(outputPath);
+    stream.pipe(res);
+    stream.on("close", () => { safeUnlink(inputPath); safeUnlink(outputPath); });
+    stream.on("error", () => { safeUnlink(inputPath); safeUnlink(outputPath); });
+  } catch (err) {
+    console.error("ffmpeg error for token", token, err.message);
+    safeUnlink(inputPath);
+    safeUnlink(outputPath);
+    res.status(500).json({ ok: false, error: "allocate_failed" });
+  }
+});
+
+router.post("/patch/log", requireBearer, (req, res) => {
+  // The client reports which TikTok account/video it detected after upload.
+  // We don't currently store this anywhere; just acknowledge it.
+  res.json({ ok: true });
 });
 
 app.use("/api/ext", router);
