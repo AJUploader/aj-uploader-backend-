@@ -285,6 +285,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// TEMP: verbose request logging to diagnose issues. Safe to remove later.
+app.use((req, res, next) => {
+  const start = Date.now();
+  const authHeader = req.headers.authorization ? "present" : "MISSING";
+  res.on("finish", () => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now()-start}ms) auth=${authHeader}`);
+  });
+  next();
+});
+
 const upload = multer({
   dest: TMP_DIR,
   limits: { fileSize: 100 * 1024 * 1024 }, // hard ceiling, per-plan check happens separately
@@ -390,10 +400,12 @@ router.post("/usage/consume", requireBearer, (req, res) => {
 // Step 1: the extension asks to start an HD upload. We check plan limits and
 // file-size limits, then hand back a one-time upload URL/token.
 router.post("/patch/allocate", requireBearer, (req, res) => {
+  console.log("patch/allocate body:", JSON.stringify(req.body));
   const { size, name, mode } = req.body || {};
   const user = req.user;
 
   if (!size || typeof size !== "number") {
+    console.log("patch/allocate rejected: bad size ->", size, typeof size);
     return res.status(400).json({ ok: false, error: "bad_request" });
   }
 
