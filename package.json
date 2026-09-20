@@ -1,23 +1,20 @@
 {
-  "name": "aj-uploader-backend",
+  "name": "aj-uploader-server",
   "version": "1.0.0",
-  "description": "AJ Uploader+ backend",
+  "description": "Backend for AJ Uploader+ extension",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "engines": {
-    "node": ">=18"
-  },
   "dependencies": {
-    "better-sqlite3": "^11.3.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "ffmpeg-static": "^5.2.0",
     "jsonwebtoken": "^9.0.2",
-    "multer": "^2.0.0",
+    "multer": "^1.4.5-lts.1",
     "nanoid": "^3.3.7",
-    "node-telegram-bot-api": "^0.66.0"
+    "node-telegram-bot-api": "^0.66.0",
+    "sqlite3": "^5.1.7"
   }
 }
