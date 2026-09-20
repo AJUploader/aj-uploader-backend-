@@ -49,6 +49,13 @@ const FFMPEG_TIMEOUT_MS = 8 * 60 * 1000;    // kill ffmpeg if it runs longer tha
 const TMP_DIR = path.join(os.tmpdir(), "aj-uploads");
 fs.mkdirSync(TMP_DIR, { recursive: true });
 
+// ---------- In-memory debug log (visible at /debug) ----------
+const recentLogs = [];
+function pushLog(s) {
+  recentLogs.push(s);
+  if (recentLogs.length > 100) recentLogs.shift();
+}
+
 // ---------- DB ----------
 const db = new Database("aj.db");
 db.pragma("journal_mode = WAL");
@@ -219,7 +226,8 @@ function buildFfmpegArgs(mode, inputPath, outputPath) {
     return [
       "-y", "-i", inputPath,
       "-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,fps=60",
-      "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+      "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+      "-threads", "2", "-x264-params", "rc-lookahead=10:ref=2",
       "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
       outputPath,
     ];
@@ -228,7 +236,8 @@ function buildFfmpegArgs(mode, inputPath, outputPath) {
   return [
     "-y", "-i", inputPath,
     "-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,fps=60",
-    "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+    "-threads", "2", "-x264-params", "rc-lookahead=10:ref=2",
     "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
     outputPath,
   ];
@@ -310,15 +319,20 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// TEMP: verbose request logging to diagnose issues. Safe to remove later.
+// Request logging (console + in-memory list shown at /debug)
 app.use((req, res, next) => {
   const start = Date.now();
   const authHeader = req.headers.authorization ? "present" : "MISSING";
   res.on("finish", () => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now()-start}ms) auth=${authHeader}`);
+    const line = `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - start}ms) auth=${authHeader}`;
+    console.log(line);
+    pushLog(line);
   });
   next();
 });
+
+// Debug page: shows the last 100 log lines. Remove once the issue is solved.
+app.get("/debug", (req, res) => res.json({ version: VERSION, logs: recentLogs }));
 
 const upload = multer({
   dest: TMP_DIR,
@@ -423,11 +437,13 @@ router.post("/usage/consume", requireBearer, (req, res) => {
 // file-size limits, then hand back a one-time upload URL/token.
 router.post("/patch/allocate", requireBearer, (req, res) => {
   console.log("patch/allocate body:", JSON.stringify(req.body));
+  pushLog("patch/allocate body: " + JSON.stringify(req.body));
   const { size, name, mode } = req.body || {};
   const user = req.user;
 
   if (!size || typeof size !== "number") {
     console.log("patch/allocate rejected: bad size ->", size, typeof size);
+    pushLog("patch/allocate rejected: bad size -> " + size + " " + typeof size);
     return res.status(400).json({ ok: false, error: "bad_request" });
   }
 
@@ -471,7 +487,8 @@ router.post("/patch/upload/:token", upload.single("file"), async (req, res) => {
 
   if (!row || row.consumed || row.expires_at < nowSec()) {
     cleanupUpload();
-    return res.status(410).json({ ok: false, error: "allocate_failed" });
+    pushLog("patch/upload: token invalid or expired");
+    return res.status(410).json({ ok: false, error: "token_invalid" });
   }
   if (!req.file) {
     return res.status(400).json({ ok: false, error: "bad_request" });
@@ -497,9 +514,10 @@ router.post("/patch/upload/:token", upload.single("file"), async (req, res) => {
     stream.on("error", () => { safeUnlink(inputPath); safeUnlink(outputPath); });
   } catch (err) {
     console.error("ffmpeg error for token", token, err.message);
+    pushLog("ffmpeg error: " + err.message);
     safeUnlink(inputPath);
     safeUnlink(outputPath);
-    res.status(500).json({ ok: false, error: "allocate_failed" });
+    res.status(500).json({ ok: false, error: "processing_failed" });
   }
 });
 
