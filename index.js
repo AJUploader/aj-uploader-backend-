@@ -1,4 +1,7 @@
 require("dotenv").config();
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
+console.log("[boot] starting...");
 const express = require("express");
 const cors = require("cors");
 const Database = require("better-sqlite3");
@@ -268,7 +271,7 @@ function safeUnlink(p) {
 }
 
 // ---------- Telegram bot (long polling) ----------
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+const bot = new TelegramBot(BOT_TOKEN, { polling: false }); // polling starts AFTER the server is listening
 
 bot.on("polling_error", (err) => console.error("polling_error:", err.message));
 
@@ -531,4 +534,8 @@ app.use("/api/ext", router);
 
 app.get("/", (req, res) => res.send("AJ Uploader+ backend is running."));
 
-app.listen(PORT, () => console.log(`AJ Uploader+ server listening on :${PORT}`));
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`AJ Uploader+ server listening on :${PORT}`);
+  bot.startPolling().then(() => console.log("[boot] telegram polling started"))
+    .catch((e) => console.error("[boot] telegram polling failed:", e.message));
+});
