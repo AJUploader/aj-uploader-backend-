@@ -470,7 +470,9 @@ router.post("/patch/allocate", requireBearer, (req, res) => {
     "INSERT INTO patch_tokens (token, telegram_id, mode, name, consumed, created_at, expires_at) VALUES (?, ?, ?, ?, 0, ?, ?)"
   ).run(token, user.telegram_id, safeMode, String(name || "video.mp4"), createdAt, createdAt + Math.floor(PATCH_TOKEN_TTL_MS / 1000));
 
-  const host = `${req.protocol}://${req.get("host")}`;
+  // Render terminates TLS at its proxy, so req.protocol says "http".
+  // The extension runs on an https page, so an http upload URL gets blocked.
+  const host = `https://${req.get("host")}`;
   res.json({
     ok: true,
     payload: {
