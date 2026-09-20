@@ -10,6 +10,7 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const jwt = require("jsonwebtoken");
 
 // ---------- Config ----------
 const PORT = process.env.PORT || 3000;
@@ -20,6 +21,15 @@ const VERSION = "1.0.0";
 if (!BOT_TOKEN) {
   console.error("Missing BOT_TOKEN in environment variables. Set it in Render → Environment.");
   process.exit(1);
+}
+
+// Stateless session signing key. Falls back to a generated value (works, but
+// invalidates old sessions on every restart) if not set — set SESSION_SECRET
+// in Render → Environment for real persistence across restarts.
+const SESSION_SECRET = process.env.SESSION_SECRET || nanoidTempSecret();
+function nanoidTempSecret() {
+  console.warn("SESSION_SECRET not set — using a random secret for this run only. Set SESSION_SECRET in Render env vars so logins survive restarts.");
+  return require("crypto").randomBytes(32).toString("hex");
 }
 
 // Plan limits (upload count)
@@ -162,14 +172,29 @@ function toProfile(user) {
   };
 }
 
+function issueSession(telegram_id) {
+  return jwt.sign({ tid: String(telegram_id) }, SESSION_SECRET, { expiresIn: Math.floor(SESSION_TTL_MS / 1000) });
+}
+
 function requireBearer(req, res, next) {
   const auth = req.headers.authorization || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
   if (!token) return res.status(401).json({ valid: false, error: "not_authorized" });
-  const row = db.prepare("SELECT * FROM sessions WHERE token = ?").get(token);
-  if (!row || row.expires_at < nowSec()) return res.status(401).json({ valid: false, error: "not_authorized" });
-  const user = getUserByTelegramId(row.telegram_id);
-  if (!user) return res.status(401).json({ valid: false, error: "not_authorized" });
+
+  let payload;
+  try {
+    payload = jwt.verify(token, SESSION_SECRET);
+  } catch (e) {
+    return res.status(401).json({ valid: false, error: "not_authorized" });
+  }
+
+  let user = getUserByTelegramId(payload.tid);
+  if (!user) {
+    // The underlying row was wiped (e.g. a free-tier restart cleared the DB)
+    // but the signed token is still valid — recreate a fresh account instead
+    // of forcing the person to reconnect Telegram every time this happens.
+    user = upsertUser({ telegram_id: payload.tid, username: null, first_name: null, avatar_url: null });
+  }
   req.user = refreshUserPeriod(user);
   req.sessionToken = token;
   next();
@@ -347,11 +372,7 @@ router.post("/auth/check", (req, res) => {
     avatar_url: poll.avatar_url,
   });
 
-  const token = nanoid(32);
-  const createdAt = nowSec();
-  db.prepare(
-    "INSERT INTO sessions (token, telegram_id, created_at, expires_at) VALUES (?, ?, ?, ?)"
-  ).run(token, user.telegram_id, createdAt, createdAt + Math.floor(SESSION_TTL_MS / 1000));
+  const token = issueSession(user.telegram_id);
 
   // Login poll consumed, remove it.
   db.prepare("DELETE FROM login_polls WHERE poll_token = ?").run(poll_token);
@@ -377,7 +398,8 @@ router.post("/session/validate", requireBearer, (req, res) => {
 });
 
 router.post("/session/logout", requireBearer, (req, res) => {
-  db.prepare("DELETE FROM sessions WHERE token = ?").run(req.sessionToken);
+  // Sessions are stateless (signed JWTs) now, so there is nothing to delete
+  // server-side — the extension just forgets the token locally.
   res.json({ ok: true });
 });
 
