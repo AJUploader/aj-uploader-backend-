@@ -532,6 +532,15 @@ router.post("/patch/log", requireBearer, (req, res) => {
   res.json({ ok: true });
 });
 
+// The extension calls this right after allocate. It was returning 404.
+// We log what it sends so we can see why, and acknowledge it.
+router.post("/tamper", (req, res) => {
+  try {
+    pushLog("tamper body: " + JSON.stringify(req.body).slice(0, 800));
+  } catch (e) {}
+  res.json({ ok: true });
+});
+
 app.use("/api/ext", router);
 
 app.get("/", (req, res) => res.send("AJ Uploader+ backend is running."));
