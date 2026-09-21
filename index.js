@@ -47,7 +47,7 @@ const FILE_LIMITS = { normal: 80, vip: 95 };
 const AUTH_CODE_TTL_MS = 5 * 60 * 1000;     // 5 minutes to enter the code
 const SESSION_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
 const PATCH_TOKEN_TTL_MS = 10 * 60 * 1000;  // 10 minutes to actually upload the file
-const FFMPEG_TIMEOUT_MS = 8 * 60 * 1000;    // kill ffmpeg if it runs longer than this
+const FFMPEG_TIMEOUT_MS = 13 * 60 * 1000;   // kill ffmpeg if it runs longer than this (extension waits 15 min)
 
 const TMP_DIR = path.join(os.tmpdir(), "aj-uploads");
 fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -248,20 +248,31 @@ function buildFfmpegArgs(mode, inputPath, outputPath) {
 
 function runFfmpeg(mode, inputPath, outputPath) {
   return new Promise((resolve, reject) => {
-    const args = buildFfmpegArgs(mode, inputPath, outputPath);
+    const args = ["-nostdin", "-stats_period", "10", ...buildFfmpegArgs(mode, inputPath, outputPath)];
     const proc = spawn(ffmpegPath, args);
     let stderr = "";
+    let lastProgressLog = 0;
+    pushLog("ffmpeg started, mode=" + mode);
     const killTimer = setTimeout(() => {
       proc.kill("SIGKILL");
       reject(new Error("ffmpeg_timeout"));
     }, FFMPEG_TIMEOUT_MS);
 
-    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.stderr.on("data", (d) => {
+      const chunk = d.toString();
+      stderr = (stderr + chunk).slice(-2000); // keep only the tail
+      const t = chunk.match(/time=(\d+:\d+:\d+\.\d+)/g);
+      const sp = chunk.match(/speed=\s*([\d.]+)x/g);
+      if (t && Date.now() - lastProgressLog > 15000) {
+        lastProgressLog = Date.now();
+        pushLog("ffmpeg progress: " + t[t.length - 1] + (sp ? " " + sp[sp.length - 1] : ""));
+      }
+    });
     proc.on("error", (err) => { clearTimeout(killTimer); reject(err); });
-    proc.on("close", (code) => {
+    proc.on("close", (code, signal) => {
       clearTimeout(killTimer);
-      if (code === 0) resolve();
-      else reject(new Error("ffmpeg_failed: " + stderr.slice(-800)));
+      if (code === 0) { pushLog("ffmpeg finished OK"); resolve(); }
+      else reject(new Error("ffmpeg_failed: code=" + code + " signal=" + signal + " " + stderr.slice(-800)));
     });
   });
 }
@@ -509,6 +520,7 @@ router.post("/patch/upload/:token", upload.single("file"), async (req, res) => {
 
   const inputPath = req.file.path;
   const outputPath = path.join(TMP_DIR, `${token}-out.mp4`);
+  pushLog("patch/upload received: " + req.file.size + " bytes, starting ffmpeg");
 
   try {
     await runFfmpeg(row.mode || "hq", inputPath, outputPath);
