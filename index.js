@@ -473,11 +473,13 @@ router.post("/patch/allocate", requireBearer, (req, res) => {
   // Render terminates TLS at its proxy, so req.protocol says "http".
   // The extension runs on an https page, so an http upload URL gets blocked.
   const host = `https://${req.get("host")}`;
+  const uploadUrl = `${host}/api/ext/patch/upload/${token}`;
+  pushLog("allocate response upload_url: " + uploadUrl + " | mode=" + safeMode);
   res.json({
     ok: true,
     payload: {
       upload_token: token,
-      upload_url: `${host}/api/ext/patch/upload/${token}`,
+      upload_url: uploadUrl,
     },
   });
 });
