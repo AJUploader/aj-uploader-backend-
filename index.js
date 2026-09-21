@@ -214,11 +214,15 @@ function requireBearer(req, res, next) {
 // mode: "hq"  -> quality re-encode, cap 1080p60
 //       "fps" -> faster encode, force 60fps, cap 1080p
 //       "4k"  -> VIP only, upscale to 4K60
+// Cap the resolution at 1080p for landscape (1920x1080) AND portrait (1080x1920),
+// never upscale, keep the aspect ratio and even dimensions.
+const SCALE_CAP =
+  "scale='if(gt(iw,ih),min(1920,iw),min(1080,iw))':'if(gt(iw,ih),min(1080,ih),min(1920,ih))':force_original_aspect_ratio=decrease:force_divisible_by=2";
+
 function buildFfmpegArgs(mode, inputPath, outputPath) {
-  const common = ["-y", "-i", inputPath, "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"];
   if (mode === "4k") {
     return [
-      ...common.slice(0, 2), inputPath,
+      "-y", "-i", inputPath,
       "-vf", "scale=3840:-2:flags=lanczos,fps=60",
       "-c:v", "libx264", "-preset", "medium", "-crf", "16",
       "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
@@ -226,21 +230,21 @@ function buildFfmpegArgs(mode, inputPath, outputPath) {
     ];
   }
   if (mode === "fps") {
+    // Same quality target, but forces 60fps.
     return [
       "-y", "-i", inputPath,
-      "-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,fps=60",
-      "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-      "-threads", "2", "-x264-params", "rc-lookahead=10:ref=2",
+      "-vf", SCALE_CAP + ",fps=60",
+      "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
       "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
       outputPath,
     ];
   }
-  // default "hq"
+  // default "hq": keeps the ORIGINAL frame rate (no duplicated frames = much
+  // less work for the CPU), caps at 1080p, quality target crf 18.
   return [
     "-y", "-i", inputPath,
-    "-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,fps=60",
-    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-    "-threads", "2", "-x264-params", "rc-lookahead=10:ref=2",
+    "-vf", SCALE_CAP,
+    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
     "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
     outputPath,
   ];
