@@ -15,6 +15,12 @@ const path = require("path");
 const os = require("os");
 const jwt = require("jsonwebtoken");
 
+// MP4 container patcher (from Rein's Uploader, MIT license - see LICENSE-Rein-MIT.txt).
+// Works on the MP4 structure only; the video stream itself is not re-encoded.
+let Patcher = null;
+try { Patcher = require("./mp4-container-patcher.js"); }
+catch (e) { console.warn("mp4-container-patcher.js not found - patch step will be skipped:", e.message); }
+
 // ---------- Config ----------
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -220,6 +226,18 @@ const SCALE_CAP =
   "scale='if(gt(iw,ih),min(1920,iw),min(1080,iw))':'if(gt(iw,ih),min(1080,ih),min(1920,ih))':force_original_aspect_ratio=decrease:force_divisible_by=2";
 
 function buildFfmpegArgs(mode, inputPath, outputPath) {
+  if (mode === "copy") {
+    // Stream copy: NO re-encoding, so no quality loss and it takes seconds
+    // even on a very weak CPU. Just rebuilds the MP4 container.
+    return [
+      "-y", "-i", inputPath,
+      "-map", "0:v:0", "-map", "0:a:0?",
+      "-c:v", "copy", "-c:a", "copy",
+      "-map_metadata", "-1", "-map_chapters", "-1",
+      "-brand", "isom", "-movflags", "+faststart",
+      outputPath,
+    ];
+  }
   if (mode === "4k") {
     return [
       "-y", "-i", inputPath,
@@ -230,7 +248,7 @@ function buildFfmpegArgs(mode, inputPath, outputPath) {
     ];
   }
   if (mode === "fps") {
-    // Same quality target, but forces 60fps.
+    // Re-encode, forces 60fps (slow on the free plan).
     return [
       "-y", "-i", inputPath,
       "-vf", SCALE_CAP + ",fps=60",
@@ -239,8 +257,7 @@ function buildFfmpegArgs(mode, inputPath, outputPath) {
       outputPath,
     ];
   }
-  // default "hq": keeps the ORIGINAL frame rate (no duplicated frames = much
-  // less work for the CPU), caps at 1080p, quality target crf 18.
+  // "reencode": fallback only (used when stream copy is not possible).
   return [
     "-y", "-i", inputPath,
     "-vf", SCALE_CAP,
@@ -279,6 +296,37 @@ function runFfmpeg(mode, inputPath, outputPath) {
       else reject(new Error("ffmpeg_failed: code=" + code + " signal=" + signal + " " + stderr.slice(-800)));
     });
   });
+}
+
+// Full pipeline: (1) stream-copy remux (or re-encode for fps/4k modes),
+// (2) MP4 container patch. If anything in the fast path fails we fall back
+// so the user still gets a usable video.
+async function processVideo(mode, inputPath, outputPath) {
+  if (mode === "hq" || mode === "copy") {
+    try {
+      await runFfmpeg("copy", inputPath, outputPath);
+    } catch (e) {
+      pushLog("stream copy failed, falling back to re-encode: " + String(e.message).slice(0, 300));
+      await runFfmpeg("reencode", inputPath, outputPath);
+    }
+  } else {
+    await runFfmpeg(mode, inputPath, outputPath);
+  }
+
+  if (!Patcher) { pushLog("patch skipped (patcher module missing)"); return; }
+  try {
+    const t0 = Date.now();
+    const fileBuf = fs.readFileSync(outputPath);
+    const input = new Uint8Array(fileBuf.buffer, fileBuf.byteOffset, fileBuf.length); // no extra copy (saves RAM)
+    const rep = Patcher.patchWithReport(input);
+    const ok = rep && rep.bytes && rep.bytes.length > 0 &&
+      (!rep.report || rep.report.videoBitstreamPreserved !== false);
+    if (!ok) throw new Error("patch result rejected");
+    fs.writeFileSync(outputPath, Buffer.from(rep.bytes.buffer, rep.bytes.byteOffset, rep.bytes.length));
+    pushLog("container patch OK in " + (Date.now() - t0) + "ms, " + input.length + " -> " + rep.bytes.length + " bytes");
+  } catch (e) {
+    pushLog("patch failed, sending unpatched video: " + e.message);
+  }
 }
 
 function safeUnlink(p) {
@@ -527,7 +575,7 @@ router.post("/patch/upload/:token", upload.single("file"), async (req, res) => {
   pushLog("patch/upload received: " + req.file.size + " bytes, starting ffmpeg");
 
   try {
-    await runFfmpeg(row.mode || "hq", inputPath, outputPath);
+    await processVideo(row.mode || "hq", inputPath, outputPath);
 
     // Mark the token used and count this upload against the user's quota
     // only once processing actually succeeded.
