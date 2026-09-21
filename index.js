@@ -475,8 +475,14 @@ router.post("/patch/allocate", requireBearer, (req, res) => {
   const host = `https://${req.get("host")}`;
   const uploadUrl = `${host}/api/ext/patch/upload/${token}`;
   pushLog("allocate response upload_url: " + uploadUrl + " | mode=" + safeMode);
+  // The extension reads these fields at the TOP LEVEL of the response
+  // (job_id + upload_token are both required). "payload" is kept for safety.
   res.json({
     ok: true,
+    job_id: token,
+    upload_token: token,
+    upload_url: uploadUrl,
+    max_size: maxMb * 1024 * 1024,
     payload: {
       upload_token: token,
       upload_url: uploadUrl,
@@ -495,7 +501,7 @@ router.post("/patch/upload/:token", upload.single("file"), async (req, res) => {
   if (!row || row.consumed || row.expires_at < nowSec()) {
     cleanupUpload();
     pushLog("patch/upload: token invalid or expired");
-    return res.status(410).json({ ok: false, error: "token_invalid" });
+    return res.status(410).json({ ok: false, error: "token_invalid", detail: "Upload token invalid or expired" });
   }
   if (!req.file) {
     return res.status(400).json({ ok: false, error: "bad_request" });
@@ -524,7 +530,7 @@ router.post("/patch/upload/:token", upload.single("file"), async (req, res) => {
     pushLog("ffmpeg error: " + err.message);
     safeUnlink(inputPath);
     safeUnlink(outputPath);
-    res.status(500).json({ ok: false, error: "processing_failed" });
+    res.status(500).json({ ok: false, error: "processing_failed", detail: "Video processing failed on the server" });
   }
 });
 
